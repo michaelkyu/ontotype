@@ -4,10 +4,6 @@ from operator import *
 from scipy.stats import hypergeom
 import numpy as np, pandas as pd
 
-# from sample_pos_and_neg import *
-# from utilities import *
-# from configure import *
-
 def load_table_as_list(f, delimiter='\t', encoding=None):    
     if encoding is None:
         f = open(f)
@@ -18,6 +14,26 @@ def load_table_as_list(f, delimiter='\t', encoding=None):
     f.close()
     return tmp    
 
+def time_print(*s):
+    from datetime import datetime
+    print ' '.join(map(str, s)), datetime.today()
+#    print s, datetime.today()
+    import sys
+    sys.stdout.flush()
+
+def igraph_2_ontology_file(g, output):
+    """
+    Writes a DAG represented as an igraph.Graph in a 3-column (parent, child, relation) ontology table format.
+
+    The 'relation' attribute of edges in the igraph.Graph object is used for the 3rd column.
+    """
+
+    tmp = np.array(g.get_edgelist())
+    names = np.array(g.vs['name'])
+    edge_array = np.hstack([names[tmp], np.array(g.es['relation']).reshape(-1, 1)])[:, [1,0,2]]
+    np.savetxt(output,
+               edge_array,
+               fmt='%s', delimiter='\t')
 
 def make_tree(graph, method='priority', edge_name='smallest_parent', parent_priority=None, edge_priority=None, default_priority=None, optim='max'):
     """Returns copy of graph with new edge attribute marking spanning tree"""
@@ -94,50 +110,57 @@ def get_lca_matrix(graph):
     ## I might deprecate this. Consider using get_smallest_ancestor instead
     return get_ancestor_matrix(graph, graph.topological_sorting(mode='out'))
 
-# Minimum 
-
-def collapse_node(g, v, edge_filter=None, use_v_name=False, combine_attrs=None, default_attr=None, verbose=True):
+def collapse_node(g, v, edge_filter=None, use_v_name=False, combine_attrs=None, default_attr=None, verbose=True, fast_collapse=False, delete=True):
 
     if use_v_name:
-        assert isinstance(v, str)
+        assert isinstance(v, (unicode, str))
         v = g.vs.find(name_eq=v).index
+    
+    if fast_collapse:
+        parents = g.neighbors(v, mode='out')
+        children = g.neighbors(v, mode='in')
+        
+        if len(parents) > 0 and len(children) > 0:
+            # A faster collapse that adds all new edges simultaneously. Ignores edge attributes        
+            new_edges = [(c, p) for p in parents for c in children]
+            new_edges = [x for x, y in zip(new_edges, g.get_eids(new_edges, error=False)) if y == -1]
+            g.add_edges(new_edges)
+    else:
+        in_edges = g.es[g.incident(v, mode='in')]
+        out_edges = g.es[g.incident(v, mode='out')]
+    
+        if edge_filter is not None:
+            in_edges = [e for e in in_edges if edge_filter(e)]
+            out_edges = [e for e in out_edges if edge_filter(e)]
 
-    if verbose: print 'Inside:', g.vs[v]['term_description']
+        for e_in in in_edges:
+            for e_out in out_edges:
 
-    in_edges = g.es[g.incident(v, mode='in')]
-    out_edges = g.es[g.incident(v, mode='out')]
+                in_neigh, out_neigh = e_in.source, e_out.target
 
-    if edge_filter is not None:
-        in_edges = [e for e in in_edges if edge_filter(e)]
-        out_edges = [e for e in out_edges if edge_filter(e)]
+                # Only add an edge if it doesn't already exist                                                                                                                   
+                if g[in_neigh, out_neigh] == 0:
+                    g.add_edge(in_neigh, out_neigh)
+                    e = g.es[g.get_eid(in_neigh, out_neigh)]
+                    if combine_attrs is not None:
+                        # Set default value of edge attributes to 0                                                                                                              
+                        for key in combine_attrs:  e[key] = None
 
-    for e_in in in_edges:
-
-        for e_out in out_edges:
-
-            in_neigh, out_neigh = e_in.source, e_out.target
-
-            # Only add an edge if it doesn't already exist
-            if g[in_neigh, out_neigh] == 0:
-                g.add_edge(in_neigh, out_neigh)
                 e = g.es[g.get_eid(in_neigh, out_neigh)]
+
+                # Update attributes                                                                                                                                              
                 if combine_attrs is not None:
-                    # Set default value of edge attributes to 0
-                    for key in combine_attrs:  e[key] = None
+                    for key in combine_attrs:
+                        e[key] = combine_attrs[key](e_in, e_out, e)
+                        if verbose and key=='triangle_edge_priority':
+                            print 'Setting', key, g.vs[in_neigh]['name'], g.vs[out_neigh]['name'], 'to', combine_attrs[key](e_in, e_out, e), (e_in[key], e_out[key])
 
-            e = g.es[g.get_eid(in_neigh, out_neigh)]
+                e['collapsed_length'] = e_in['collapsed_length'] + e_out['collapsed_length']
+                e['collapsed_terms'] = e_in['collapsed_terms'] + [g.vs[v]['name']] + e_out['collapsed_terms']
 
-            # Update attributes
-            if combine_attrs is not None:
-                for key in combine_attrs:
-                    e[key] = combine_attrs[key](e_in, e_out, e)
-                    if verbose and key=='triangle_edge_priority':
-                        print 'Setting', key, g.vs[in_neigh]['name'], g.vs[out_neigh]['name'], 'to', combine_attrs[key](e_in, e_out, e), (e_in[key], e_out[key])
-
-            e['collapsed_length'] = e_in['collapsed_length'] + e_out['collapsed_length']
-            e['collapsed_terms'] = e_in['collapsed_terms'] + [g.vs[v]['name']] + e_out['collapsed_terms']
-
-    g.delete_vertices(v)    
+    if delete:
+        g.delete_vertices(v)
+    
     return g
 
 def map_gene_pairs_2_triangles(ontology, gsets):
@@ -241,7 +264,7 @@ class Ontology:
                  verbose=True):
         """
         ontology: File path to term-to-term edges
-        mapping:  File path to gene-to-term edges        
+        mapping:  File path to gene-to-term edges
         """
 
         if isinstance(ontology_file, str) and (not os.path.exists(ontology_file)) and ontology_file in ['all', 'bp', 'cc', 'mf']:
@@ -250,16 +273,49 @@ class Ontology:
             # else:
             #     raise Exception("%s isn't recognized as an ontology" % ontology_file)
 
-        ontology_table = load_table_as_list(ontology_file, encoding=encoding) if (isinstance(ontology_file, str) and os.path.exists(ontology_file)) else ontology_file
-            
-        if combined_file:
+        ## <ontology_file> can be of different formats.
+        ## TODO: change variable name to <ontology>
+        if isinstance(ontology_file, str):
+            if os.path.exists(ontology_file):
+                ontology_table = load_table_as_list(ontology_file, encoding=encoding)
+            else:
+                ontology_table = ontology_file
+        elif isinstance(ontology_file, igraph.Graph):
+            ## Assumes the igraph object is directed such that the
+            ## source node is the child term or gene and the target
+            ## node is the parent term
+
+            names = np.array(ontology_file.vs['name'])
+            tmp = np.array(ontology_file.get_edgelist())
+            if 'relation' in ontology_file.edge_attributes():
+                ontology_table = np.hstack([names[tmp], np.array(ontology_file.es['relation']).reshape(-1, 1)])
+            else:
+                ontology_table = names[tmp]
+            ontology_table = ontology_table.tolist()
+        else:
+            ## Assume that the input is already in the desired format:
+            ## a list of (child, parent, relation (optional) ) tuples
+            assert not isinstance(ontology_file, (str, unicode)) and hasattr(ontology_file, '__iter__')
+            ontology_table = ontology_file
+
+        if combined_file: 
             mapping_table = [x for x in ontology_table if x[2]=='gene']
             ontology_table = [x for x in ontology_table if x[2]!='gene']
         else:
             if mapping_file is None:                
                 mapping_file = ontology_file + '.mapping'      
                 if verbose: print 'Assuming that mapping file is', mapping_file
-            mapping_table = load_table_as_list(mapping_file, encoding=encoding) if (isinstance(mapping_file, str) and os.path.exists(mapping_file)) else mapping_file
+
+            if (isinstance(mapping_file, str) and os.path.exists(mapping_file)):
+                mapping_table = load_table_as_list(mapping_file, encoding=encoding)
+            elif isinstance(mapping_file, igraph.Graph):
+                names = np.array(mapping_file.vs['name'])
+                tmp = np.array(mapping_file.get_edgelist())
+                mapping_table = np.hstack([names[tmp], np.array(mapping_file.es['relation']).reshape(-1, 1)])
+                mapping_table = mapping_table.tolist()
+            else:
+                assert not isinstance(mapping_file, (str, unicode)) and hasattr(mapping_file, '__iter__')
+                mapping_table = mapping_file
 
         if parent_child:
             ontology_table = [[x[1],x[0]]+list(x[2:]) for x in ontology_table]
@@ -281,17 +337,18 @@ class Ontology:
                                              key=lambda a:a[1])}
 
         # Extract parent-child relations, if they exist
-        if all([len(x)==3 for x in ontology_table]):
+        if any([len(x)>=3 for x in ontology_table]):
             # relation_dict[(child, parent)] --> edge relation, e.g. 'is_a' or 'part_of'            
-            self.relation_dict = {(a,b) : relation for a, b, relation in ontology_table}
-
+            self.relation_dict = {(x[0],x[1]) : x[2] if len(x)>=3 else None for x in ontology_table}
 
         if add_root is not None:
             ## Check if there is a single unifying root term of the ontology. If not, then identify the multiple roots and join them under an artificial root
             root_list = set(term_2_terms.keys()) - set([y for x in term_2_terms.values() for y in x])
+            print len(root_list)
+            print root_list
             if len(root_list) > 1:
                 root_name = add_root
-                term_2_term[root_name] = root_list
+                term_2_terms[root_name] = root_list
                 if self.has_attr('relation_dict'):
                     for r in root_list:
                         relation_dict[(r, root_name)] = 'artificial_root'
@@ -335,13 +392,12 @@ class Ontology:
         # print len(terms_A), len(terms_B), len(terms_A & terms_B)
         # assert terms_B.issubset(terms_A)
 
-        if not terms_B.issubset(terms_A):
-            if verbose: print 'WARNING: There are {} orphaned terms that are annotated to genes but not connected to the rest of the ontology'.format(len(terms_B - terms_A))
-            # print 'WARNING: Removing orphaned terms'
-            # gene_2_terms = {g : sorted(set(t) & terms_A) for g, t in gene_2_terms.items()}        
+        if verbose and len(terms_B - terms_A)>0:
+            print 'WARNING: There are {} terms that are annotated to genes but not connected to the rest of the ontology'.format(len(terms_B - terms_A))
+        if verbose and len(terms_A - terms_B)>0:
+            print 'WARNING: There are {} terms that have no direct gene annotations'.format(len(terms_A - terms_B))
             
         terms = sorted(list(terms_A | terms_B))
-#        terms = sorted(list(terms_A))
         genes = sorted(gene_2_terms.keys())
         
         ## terms_index[<term_name>] --> index in self.terms
@@ -358,7 +414,6 @@ class Ontology:
         # child_2_parents_indices[<term_name>] --> list of indices of <term_name>'s parent terms
         child_2_parents_indices = {r : [terms_index[x] for x in v] for r, v in child_2_parents.items()}
 
-
         self.term_2_terms = term_2_terms
         self.child_2_parents = child_2_parents
         self.child_2_parents_indices = child_2_parents_indices
@@ -370,25 +425,57 @@ class Ontology:
         
         if verbose: print 'Done constructing ontology'
 
-    def collapse_ontology(self, subsume_child):
-        #(g, v, edge_filter=None, use_v_name=False, combine_attrs=None, default_attr=None, verbose=True):
+    def collapse_ontology(self, verbose=True, default_relation='default', min_term_size=2):
+        ## Returns a new ontology where redundant and empty terms have been collapsed
 
-        g = self.get_igraph()
+        g = self.get_igraph().copy()
+        if verbose: print len(g.vs), 'total nodes'
 
+        if verbose: print 'Propagating annotations'
         self.propagate_annotations()
 
         # Get term_2_genes
-        del self.term_2_genes
-        term_2_genes = {t : set(g_list) for t, g_list in self.get_term_2_genes().items()}
+        if hasattr(self, 'term_2_genes'):
+            del self.term_2_genes
 
-        # Iterate from leaves up
-        for v in g.topological_sorting(mode='out'):
-            v_genes = term_2_genes[g.vs[v]['name']]
-            if len(v_genes)==0:
-                g = collapse_node(g, v, verbose=False)
-            if any([v_genes==term_2_genes[g.vs[p]['name']] for p in g.neighbors(v, mode='out')]):
-                g = collapse_node(g, v, verbose=False)
+        parity = True
+        while True:
+            names_2_idx = {b : a for a, b in enumerate(g.vs['name'])}
+            term_hash = {names_2_idx[t] : (len(g_list), hash(tuple(g_list))) for t, g_list in self.get_term_2_genes().items() if names_2_idx.has_key(t)}
 
+            if verbose: time_print('Identify nodes to collapse')
+            node_order = g.topological_sorting(mode='out')
+
+            small_terms = [v for v in node_order if term_hash[v][0]<min_term_size]
+
+            same_as_all_parents = [v for v in node_order \
+                                      if (len(g.neighbors(v, mode='out'))>0 and all(term_hash[v]==term_hash[y] for y in g.neighbors(v, mode='out')))]
+            same_as_all_children = [v for v in node_order \
+                                      if (len(g.neighbors(v, mode='in'))>0 and all(term_hash[v]==term_hash[y] for y in g.neighbors(v, mode='in')))]
+            if verbose: time_print('%s empty terms, %s (%s) terms that are redundant with all their parents (children)' % \
+                       (len(small_terms), len(same_as_all_parents), len(same_as_all_children)))
+
+            to_delete = list(set(small_terms) | set(same_as_all_children if parity else same_as_all_parents))
+
+            if verbose: time_print('Collapsing %s empty terms and %s terms that redundant with its %s' % \
+                                   (len(small_terms),
+                                    len(same_as_all_children) if parity else len(same_as_all_parents),
+                                    'children' if parity else 'parents'))
+            parity = not parity
+
+            if len(to_delete)==0:
+                break
+            else:
+                for v in to_delete:
+                    g = collapse_node(g, v, use_v_name=False, verbose=False, fast_collapse=True, delete=False)
+                g.delete_vertices(to_delete)
+
+        g.es(relation_eq=None)['relation'] = default_relation
+
+        remaining_terms = set([self.terms_index[x] for x in g.vs['name']])
+        return Ontology(g,
+                        mapping_file=[(gene, self.terms[t]) for gene, t_list in self.gene_2_terms.items() for t in t_list if t in remaining_terms],
+                        combined_file=False, parent_child=False)
         
     def delete_terms(self, terms_to_delete):
         print 'Returning new ontology with %s terms removed' % len(terms_to_delete)
@@ -400,44 +487,55 @@ class Ontology:
         ontology_file.flush()
         return Ontology(ontology_file.name, combined_file=True, parent_child=False)
 
-    # ## It's too difficult to mutate the ontology structure. It'd be better to just remake the ontology using the constructor
-    # def delete_terms(self, terms_to_remove, remove_orphaned_genes=True):
-    #     print 'Deleting %s terms' % len(terms_to_remove)
+    def delete_genes(self, genes_to_delete, collapse=True, default_relation='default'):
 
-    #     term_2_genes = self.get_term_2_genes()
+        if hasattr(self, 'relation_dict') and len(self.relation_dict)>0:
+            ontology_table = [(c, p, self.relation_dict.get((c,p), default_relation)) for p, c_list in self.term_2_terms.items() for c in c_list]
+        else:
+            ontology_table = [(c, p) for p, c_list in self.term_2_terms.items() for c in c_list]
+        
+        if isinstance(genes_to_delete, set):
+            genes_to_delete = set(genes_to_delete)
 
-    #     for t in terms_to_remove:
-    #         t_index = self.terms_index[t]
+        mapping_table = [(g, self.terms[t]) for g, t_list in self.gene_2_terms.items() if g not in genes_to_delete for t in t_list]
+        
+        ont = Ontology(ontology_table, mapping_table, parent_child=False, combined_file=False)
+        
+        if collapse:
+            return ont.collapse_ontology()
+        else:
+            return ont
 
-    #         self.terms.remove(t)
+    def write_ontology(self, output, parent_child=True, encoding=None, default_relation=u'default'):
 
-    #         try: del self.term_2_terms[t]
-    #         except: pass
+        assert parent_child
+
+        if encoding:
+            import codecs
+            f = codecs.open(output, 'w', encoding=encoding)
+        else:
+            f = open(output, 'w')
+
+        if hasattr(self, 'relation_dict'):
+            f.write(u'\n'.join([u'%s\t%s\t%s' % (p,c, self.relation_dict.get((c, p), default_relation)) for p, c_list in self.term_2_terms.items() for c in c_list]))
+            f.write(u'\n')
+            f.write(u'\n'.join([u'%s\t%s\tgene' % (self.terms[t], g) for g, t_list in self.gene_2_terms.items() for t in t_list]))
+        else:
+            f.write(u'\n'.join([u'%s\t%s\t%s' % (p,c, default_relation) for p, c_list in self.term_2_terms.items() for c in c_list]))
+            f.write(u'\n')
+            f.write(u'\n'.join([u'%s\t%s\tgene' % (self.terms[t], g) for g, t_list in self.gene_2_terms.items() for t in t_list]))
+        f.write(u'\n')
+        f.close()
                 
-    #         try: del self.child_2_parents[t]
-    #         except: pass
+    def copy(self):
+        if hasattr(self, 'relation_dict'):
+            ontology_file = [(c,p,self.relation_dict.get((c,p))) for p, c_list in self.term_2_terms.items() for c in c_list]
+        else:
+            ontology_file = [(c,p) for p, c_list in self.term_2_terms.items() for c in c_list]
             
-    #         try: del self.child_2_parents_indices[t_index]
-    #         except: pass
-
-    #         #print t, type(t), [self.genes[g] for g in term_2_genes[t]]
-    #         for g in term_2_genes[t]:
-    #             # print 'gene/term', self.genes[g], t
-    #             # print self.gene_2_terms[self.genes[g]]
-    #             self.gene_2_terms[self.genes[g]].remove(t_index)               
-
-    #     self.terms_index = {b : a for a, b in enumerate(self.terms)}
-    #     for g_orphan in [g for g, x in self.gene_2_terms.items() if len(x)==0]:
-    #         self.genes.remove(g_orphan)
-    #     self.genes_index = {b : a for a, b in enumerate(self.genes)}
-
-    #     del self.term_2_genes
-
-
-
-    # def write_ontology(self, out):
-    #     out.write(
-
+        return Ontology(ontology_file=ontology_file,
+                        mapping_file=[(g,self.terms[t]) for g, t_list in self.gene_2_terms.items() for t in t_list],
+                        combined_file=False, parent_child=False)
 
     def transitive_closure(self, g=None):
 
@@ -482,11 +580,6 @@ class Ontology:
         return g
         
         ## Update term_2_terms , child_2_parents, child_2_parents_indices
-
-    # def a(
-    #     d = self.get_connectivity_matrix()
-
-    #     x[~ d[x.reshape(-1,1), x].any(1)]
 
     def semantic_similarity(self, genes_subset=None, term_sizes='subset', between_terms=False, output='Resnik'):
         """Computes the semantic similarity between pair of genes in
@@ -564,7 +657,7 @@ class Ontology:
             # Dict: (g1,g2) gene pairs --> list of term indices
             return {(g1,g2) : x for (g1, g2), x in zip(combinations(genes_subset, 2), sca_list)}
 
-    def get_term_2_genes(self, verbose=True):
+    def get_term_2_genes(self, verbose=True): 
         if not hasattr(self, 'term_2_genes'):
             if verbose: print 'Calculating term_2_genes'
             self.term_2_genes = {self.terms[c]: [self.genes_index[x[0]] for x in d] \
@@ -580,7 +673,11 @@ class Ontology:
         "Returns an array of term sizes in the same order as self.terms"
 
         if not hasattr(self, 'term_sizes'):
-            self.term_sizes = np.vstack([np.bincount(x, minlength=len(self.terms)) for x in self.gene_2_terms.values()]).sum(0)
+            from collections import Counter
+            tmp = Counter([x for y in self.gene_2_terms.values() for x in y])
+            self.term_sizes = [tmp[x] for x in range(len(self.terms))]
+
+#            self.term_sizes = np.vstack([np.bincount(x, minlength=len(self.terms)) for x in self.gene_2_terms.values()]).sum(0)
 #            self.term_sizes = np.bincount(np.concatenate([np.array(x) for x in self.gene_2_terms.values()]))
 #            self.term_sizes = np.bincount(reduce(lambda a,b : a+b, self.gene_2_terms.values()))
         
@@ -723,17 +820,17 @@ class Ontology:
         # else:
         #     raise Exception('Unhandled ann_defn: %s' % ann_defn)
             
-    @classmethod
-    def get_ontology_prefix(cls, **kwargs):
-        ## OLD!
-        ontology_prefix = os.path.join(kwargs['NNstructures'],
-                                       'start_%s' % kwargs['start_ontology'],
-                                       'evidence_%s' % kwargs['evidence'],
-                                       'propagate_%s' % kwargs['propagate'],
-                                       'ontology_%s' % kwargs['ontology'],
-                                       '%s.propagated' % kwargs['collapse_scheme'])
+    # @classmethod
+    # def get_ontology_prefix(cls, **kwargs):
+    #     ## OLD!
+    #     ontology_prefix = os.path.join(kwargs['NNstructures'],
+    #                                    'start_%s' % kwargs['start_ontology'],
+    #                                    'evidence_%s' % kwargs['evidence'],
+    #                                    'propagate_%s' % kwargs['propagate'],
+    #                                    'ontology_%s' % kwargs['ontology'],
+    #                                    '%s.propagated' % kwargs['collapse_scheme'])
         
-        return ontology_prefix
+    #     return ontology_prefix
 
     @classmethod
     def create_ontology(cls, folder, start_ontology, evidence, ontology, collapse_scheme, genes=None):
@@ -777,10 +874,16 @@ class Ontology:
         self.terms
         """
 
+        if hasattr(self, 'relation_dict') and len(self.relation_dict)>0:
+            edge_attrs = {'relation': [self.relation_dict[(c, p)] for p, children in self.term_2_terms.items() for c in children]}
+        else:
+            edge_attrs = {}
+
         self.graph = igraph.Graph(n=len(self.terms),
                                   edges=[(self.terms_index[c], self.terms_index[p]) for p, children in self.term_2_terms.items() for c in children],
                                   directed=True,
-                                  vertex_attrs={'name':self.terms})
+                                  vertex_attrs={'name':self.terms},
+                                  edge_attrs=edge_attrs)
         
         # if not hasattr(self, 'graph'):
 
@@ -968,9 +1071,7 @@ class Ontology:
         return terms_list[~ np.any(connectivity_matrix_nodiag[children_list, :][:, terms_list], axis=0)]
 
     def propagate_annotations(self, direction='forward', method='iterative_union'):
-        """                                                                                                                                                                                                        
-        Propagates the gene-term annotations through the ontology                                                                                                                                                  
-        """
+        """                                                                                                                                                                         Propagates the gene-term annotations through the ontology                                                                                                                   """
 
         if direction=='forward':
             if method=='iterative_union':
@@ -978,23 +1079,19 @@ class Ontology:
                 child_2_parents_idx = {self.terms_index[c] : [self.terms_index[p] for p in p_list] for c, p_list in self.child_2_parents.items()}
                 gene_2_terms_set = {g : set(t_list) for g, t_list in self.gene_2_terms.items()}
 
-                genes_to_update = self.gene_2_terms.keys()
+                genes_to_update = set(self.gene_2_terms.keys())
                 count = 0
                 while len(genes_to_update) > 0:
                     # Iterate over a copy of genes_to_update
-                    for g in genes_to_update[:]:
+                    for g in genes_to_update.copy():
                         curr_terms = gene_2_terms_set[g]
-                        new_terms = set([p for t in curr_terms for p in child_2_parents_idx.get(t, [])])
+                        num_old = len(curr_terms)
+                        curr_terms.update(set([p for t in curr_terms for p in child_2_parents_idx.get(t, [])]))
+                        if len(curr_terms) == num_old:
+                            genes_to_update.remove(g)                        
 
-                        union_terms = curr_terms | new_terms
-                        if len(union_terms) == len(curr_terms):
-                            genes_to_update.remove(g)
-                        else:
-                            gene_2_terms_set[g] = union_terms
-                
                     print count,
                     count +=1
-
                     if count == 1000:
                         0 / asdf 
                 print
@@ -1003,37 +1100,26 @@ class Ontology:
                 ancestor_matrix = np.array(self.get_connectivity_matrix(), dtype=np.int32)
                 self.gene_2_terms = {g : ancestor_matrix[t, :].sum(0).nonzero()[0].tolist() for g, t in self.gene_2_terms.items()}
 
-            if hasattr(self, 'term_2_genes'):
-                del self.term_2_genes
-            if hasattr(self, 'term_sizes'):
-                del self.term_sizes
+        elif direction=='backward':
+            print 'WARNING: assumes that annotations are already forward propagated'
+            # parent_2_children_idx = {self.terms_index[p] : [self.terms_index[c] for c in c_list] for p, c_list in self.term_2_terms.items()}
+            # gene_2_terms_set = {g : set(t_list) for g, t_list in self.gene_2_terms.items()}
 
+            # graph = self.get_igraph()
+            # for parent in graph.vs[graph.topological_sorting(mode='in')]['name']:
+            #     for c in parent_2_children_idx[parent]
+
+            # self.gene_2_terms = {g : sorted(t_set) for g, t_set in gene_2_terms_set.items()}
         else:
             raise Exception('Unsupported direction')
 
+        if hasattr(self, 'term_2_genes'):
+            del self.term_2_genes
+        if hasattr(self, 'term_sizes'):
+            del self.term_sizes
         if hasattr(self, 'connectivity_matrix'):
             del self.connectivity_matrix
 
-
-    # def propagate_annotations(self, direction='forward', sparse=False):
-    #     """
-    #     Propagates the gene-term annotations through the ontology
-    #     """
-
-    #     if direction=='forward':
-    #         if sparse:
-    #             ancestor_matrix = scipy.sparse.csr_matrix(self.get_connectivity_matrix(sparse=sparse), dtype=np.int32)
-    #         else:
-    #             ancestor_matrix = np.array(self.get_connectivity_matrix(sparse=sparse), dtype=np.int32)
-
-    #         self.gene_2_terms = {g : ancestor_matrix[t, :].sum(0).nonzero()[0].tolist() for g, t in self.gene_2_terms.items()}
-    #         if hasattr(self, 'term_2_genes'):
-    #             del self.term_2_genes
-    #         if hasattr(self, 'term_sizes'):
-    #             del self.term_sizes
-
-    #     else:
-    #         raise Exception('Unsupported direction')
 
     def propagate(self, ontotypes, prop, ontotype_size, max_ontotype, method='fixed_size'):
         """
@@ -1366,253 +1452,264 @@ class Ontology:
             
             return features        
 
+    def summary(self):
+        return '%s genes, %s terms, %s gene-term relations, %s term-term relations' % \
+            (len(self.genes), len(self.terms), sum([len(x) for x in self.gene_2_terms.values()]), sum([len(x) for x in self.term_2_terms.values()]))
 
 
-    def pair_enrichment(self, labels, logger=None):
 
-        if logger is None: logger = logging.getLogger(multiprocessing.current_process().name)
+################
+# Scratch code #
+################
 
-        logger.debug('Calculating pairwise term enrichment')
 
-        logger.debug('Calculating background likelihood')
-        gsets = [(x, y) for x, y, z in zip(labels.labels, labels.Gset.gset_list, labels.Gset.to_remove) if not z]        
-        total_pos = sum(x for x, y in gsets)
-        total_neg = len(gsets) - total_pos        
-        background_ll = float(total_pos) / (total_pos + total_neg)
-        logger.debug('Total Pos / Neg: %s / %s', total_pos, total_neg)
-        logger.debug('Background likelihood: %s', background_ll)
+
+    # def pair_enrichment(self, labels, logger=None):
+
+    #     if logger is None: logger = logging.getLogger(multiprocessing.current_process().name)
+
+    #     logger.debug('Calculating pairwise term enrichment')
+
+    #     logger.debug('Calculating background likelihood')
+    #     gsets = [(x, y) for x, y, z in zip(labels.labels, labels.Gset.gset_list, labels.Gset.to_remove) if not z]        
+    #     total_pos = sum(x for x, y in gsets)
+    #     total_neg = len(gsets) - total_pos        
+    #     background_ll = float(total_pos) / (total_pos + total_neg)
+    #     logger.debug('Total Pos / Neg: %s / %s', total_pos, total_neg)
+    #     logger.debug('Background likelihood: %s', background_ll)
                                                 
-        assert labels.Gset.dims == [2]
+    #     assert labels.Gset.dims == [2]
 
-        logger.debug('Forming term pairs')
-        term_pairs = list(itertools.combinations(range(len(self.terms)), 2))
-        term_pairs_index = {b:a for a,b in enumerate(term_pairs)}
+    #     logger.debug('Forming term pairs')
+    #     term_pairs = list(itertools.combinations(range(len(self.terms)), 2))
+    #     term_pairs_index = {b:a for a,b in enumerate(term_pairs)}
 
-        pos_gsets = [gset for pos, gset in gsets if pos]
-        neg_gsets = [gset for pos, gset in gsets if not pos]
+    #     pos_gsets = [gset for pos, gset in gsets if pos]
+    #     neg_gsets = [gset for pos, gset in gsets if not pos]
 
-        # g = igraph.Graph.Read_Ncol(self.ontology_prefix)
-        # g_vs_index = {b:a for a,b in enumerate(g.vs['name'])}        
-        # m = numpy.matrix(g.get_adjacency().data)
+    #     # g = igraph.Graph.Read_Ncol(self.ontology_prefix)
+    #     # g_vs_index = {b:a for a,b in enumerate(g.vs['name'])}        
+    #     # m = numpy.matrix(g.get_adjacency().data)
 
-        # root = np.where(m.sum(1) == 0)[0][0,0]
+    #     # root = np.where(m.sum(1) == 0)[0][0,0]
 
         
-        # part = dict()
-        # part[root] = pos_gset
+    #     # part = dict()
+    #     # part[root] = pos_gset
 
-        # # Calculate gset_2_terms
+    #     # # Calculate gset_2_terms
 
-        # for v in g.bfs(root, mode='in')[0]:
-        #     current_gsets = part[v]
+    #     # for v in g.bfs(root, mode='in')[0]:
+    #     #     current_gsets = part[v]
 
-        #     children = g.neighbors(v, mode='in')
-        #     for child in children:
-        #         part[child] = [gset for gset in current_gsets if child in gset_2_terms[gset]]                            
-        #     for child1, child2 in itertools.combinations(g.vs[children]['name'], 2):
-        #         term_pairs_index[terms_index[child1], terms_index[child2]
-        #         terms_index[child2]
+    #     #     children = g.neighbors(v, mode='in')
+    #     #     for child in children:
+    #     #         part[child] = [gset for gset in current_gsets if child in gset_2_terms[gset]]                            
+    #     #     for child1, child2 in itertools.combinations(g.vs[children]['name'], 2):
+    #     #         term_pairs_index[terms_index[child1], terms_index[child2]
+    #     #         terms_index[child2]
         
-        #     # All pairs of terms
+    #     #     # All pairs of terms
             
-        #     del part[v]
+    #     #     del part[v]
 
-        gene_2_terms_set = { g: set(t) for g, t in self.gene_2_terms.items() }
+    #     gene_2_terms_set = { g: set(t) for g, t in self.gene_2_terms.items() }
 
-        n = len(self.terms)
+    #     n = len(self.terms)
 
-        #def f(i, j, n): return n * i - i * (i+1) / 2 + j- i - 1
+    #     #def f(i, j, n): return n * i - i * (i+1) / 2 + j- i - 1
 
-        p = multiprocessing.Pool(processes=16)
+    #     p = multiprocessing.Pool(processes=16)
 
         
-        # pos_gsets = pos_gsets[:10000]
-        # neg_gsets = neg_gsets[:10000]
+    #     # pos_gsets = pos_gsets[:10000]
+    #     # neg_gsets = neg_gsets[:10000]
 
-        # pos_gsets = random.sample(pos_gsets, min(len(pos_gsets), 300000))
-        # neg_gsets = random.sample(neg_gsets, min(len(neg_gsets), 300000))
+    #     # pos_gsets = random.sample(pos_gsets, min(len(pos_gsets), 300000))
+    #     # neg_gsets = random.sample(neg_gsets, min(len(neg_gsets), 300000))
 
-        logger.debug('Calculating spanning pos gene pairs')
-        logger.debug('Time: %s', time.time())
-        #pos_spanning = [term_pairs_index[(tA, tB) if tA < tB else (tB, tA)] for g1, g2 in pos_gsets for tA in self.gene_2_terms[g1] for tB in self.gene_2_terms[g2] if tA != tB]
+    #     logger.debug('Calculating spanning pos gene pairs')
+    #     logger.debug('Time: %s', time.time())
+    #     #pos_spanning = [term_pairs_index[(tA, tB) if tA < tB else (tB, tA)] for g1, g2 in pos_gsets for tA in self.gene_2_terms[g1] for tB in self.gene_2_terms[g2] if tA != tB]
 
-        rem, quot = len(pos_gsets) % 16, len(pos_gsets) / 16
-        pos_gsets_groups = [pos_gsets[i * quot + (i if i < rem else rem):
-                                      (i+1) * quot + (i+1 if i < rem else rem)] for i in range(16)]
+    #     rem, quot = len(pos_gsets) % 16, len(pos_gsets) / 16
+    #     pos_gsets_groups = [pos_gsets[i * quot + (i if i < rem else rem):
+    #                                   (i+1) * quot + (i+1 if i < rem else rem)] for i in range(16)]
 
-        # pos_spanning_union = p.map(span_union, [(x, gene_2_terms_set, n) for x in pos_gsets_groups])
-        pos_spanning_symm = p.map(span_11, [(x, gene_2_terms_set, n) for x in pos_gsets_groups])
+    #     # pos_spanning_union = p.map(span_union, [(x, gene_2_terms_set, n) for x in pos_gsets_groups])
+    #     pos_spanning_symm = p.map(span_11, [(x, gene_2_terms_set, n) for x in pos_gsets_groups])
 
-        # pos_spanning_union = [b for a in p.map(span_union, [(x, gene_2_terms_set, n) for x in pos_gsets_groups]) for b in a]
-        # pos_spanning_symm = [b for a in p.map(span_11, [(x, gene_2_terms_set, n) for x in pos_gsets_groups]) for b in a]
+    #     # pos_spanning_union = [b for a in p.map(span_union, [(x, gene_2_terms_set, n) for x in pos_gsets_groups]) for b in a]
+    #     # pos_spanning_symm = [b for a in p.map(span_11, [(x, gene_2_terms_set, n) for x in pos_gsets_groups]) for b in a]
 
-        # pos_spanning_union = [n*b[0] - b[0]*(b[0]+1)/2 + b[1] - b[0] - 1 if b[0] < b[1] else n*b[1] - b[1]*(b[1]+1)/2 + b[0] - b[1] - 1 \
-        #                 for g1, g2 in pos_gsets for b in itertools.combinations(gene_2_terms_set[g1] | gene_2_terms_set[g2], 2)]
-        # pos_spanning_symm = [n*b[0] - b[0]*(b[0]+1)/2 + b[1] - b[0] - 1 if b[0] < b[1] else n*b[1] - b[1]*(b[1]+1)/2 + b[0] - b[1] - 1 \
-        #                 for g1, g2 in pos_gsets for b in itertools.combinations(gene_2_terms_set[g1] ^ gene_2_terms_set[g2], 2)]
+    #     # pos_spanning_union = [n*b[0] - b[0]*(b[0]+1)/2 + b[1] - b[0] - 1 if b[0] < b[1] else n*b[1] - b[1]*(b[1]+1)/2 + b[0] - b[1] - 1 \
+    #     #                 for g1, g2 in pos_gsets for b in itertools.combinations(gene_2_terms_set[g1] | gene_2_terms_set[g2], 2)]
+    #     # pos_spanning_symm = [n*b[0] - b[0]*(b[0]+1)/2 + b[1] - b[0] - 1 if b[0] < b[1] else n*b[1] - b[1]*(b[1]+1)/2 + b[0] - b[1] - 1 \
+    #     #                 for g1, g2 in pos_gsets for b in itertools.combinations(gene_2_terms_set[g1] ^ gene_2_terms_set[g2], 2)]
 
-        logger.debug('Calculating spanning neg gene pairs')
-        logger.debug('Time: %s', time.time())
-        #neg_spanning = [term_pairs_index[(tA, tB) if tA < tB else (tB, tA)] for g1, g2 in neg_gsets for tA in self.gene_2_terms[g1] for tB in self.gene_2_terms[g2] if tA != tB]
+    #     logger.debug('Calculating spanning neg gene pairs')
+    #     logger.debug('Time: %s', time.time())
+    #     #neg_spanning = [term_pairs_index[(tA, tB) if tA < tB else (tB, tA)] for g1, g2 in neg_gsets for tA in self.gene_2_terms[g1] for tB in self.gene_2_terms[g2] if tA != tB]
 
-        rem, quot = len(neg_gsets) % 16, len(neg_gsets) / 16
-        neg_gsets_groups = [neg_gsets[i * quot + (i if i < rem else rem):
-                                      (i+1) * quot + (i+1 if i < rem else rem)] for i in range(16)]
+    #     rem, quot = len(neg_gsets) % 16, len(neg_gsets) / 16
+    #     neg_gsets_groups = [neg_gsets[i * quot + (i if i < rem else rem):
+    #                                   (i+1) * quot + (i+1 if i < rem else rem)] for i in range(16)]
 
-        # neg_spanning_union = p.map(span_union, [(x, gene_2_terms_set, n) for x in neg_gsets_groups])
-        neg_spanning_symm = p.map(span_11, [(x, gene_2_terms_set, n) for x in neg_gsets_groups])
+    #     # neg_spanning_union = p.map(span_union, [(x, gene_2_terms_set, n) for x in neg_gsets_groups])
+    #     neg_spanning_symm = p.map(span_11, [(x, gene_2_terms_set, n) for x in neg_gsets_groups])
 
-        # neg_spanning_union = [b for a in p.map(span_union, [(x, gene_2_terms_set, n) for x in neg_gsets_groups]) for b in a]
-        # neg_spanning_symm = [b for a in p.map(span_11, [(x, gene_2_terms_set, n) for x in neg_gsets_groups]) for b in a]
+    #     # neg_spanning_union = [b for a in p.map(span_union, [(x, gene_2_terms_set, n) for x in neg_gsets_groups]) for b in a]
+    #     # neg_spanning_symm = [b for a in p.map(span_11, [(x, gene_2_terms_set, n) for x in neg_gsets_groups]) for b in a]
 
-        # neg_spanning_union = [n*b[0] - b[0]*(b[0]+1)/2 + b[1] - b[0] - 1 if b[0] < b[1] else n*b[1] - b[1]*(b[1]+1)/2 + b[0] - b[1] - 1 \
-        #                 for g1, g2 in neg_gsets for b in itertools.combinations(gene_2_terms_set[g1] | gene_2_terms_set[g2], 2)]
-        # neg_spanning_symm = [n*b[0] - b[0]*(b[0]+1)/2 + b[1] - b[0] - 1 if b[0] < b[1] else n*b[1] - b[1]*(b[1]+1)/2 + b[0] - b[1] - 1 \
-        #                 for g1, g2 in neg_gsets for b in itertools.combinations(gene_2_terms_set[g1] ^ gene_2_terms_set[g2], 2)]
+    #     # neg_spanning_union = [n*b[0] - b[0]*(b[0]+1)/2 + b[1] - b[0] - 1 if b[0] < b[1] else n*b[1] - b[1]*(b[1]+1)/2 + b[0] - b[1] - 1 \
+    #     #                 for g1, g2 in neg_gsets for b in itertools.combinations(gene_2_terms_set[g1] | gene_2_terms_set[g2], 2)]
+    #     # neg_spanning_symm = [n*b[0] - b[0]*(b[0]+1)/2 + b[1] - b[0] - 1 if b[0] < b[1] else n*b[1] - b[1]*(b[1]+1)/2 + b[0] - b[1] - 1 \
+    #     #                 for g1, g2 in neg_gsets for b in itertools.combinations(gene_2_terms_set[g1] ^ gene_2_terms_set[g2], 2)]
 
-        logger.debug('Summing up counts')
-        logger.debug('Time: %s', time.time())
-        ## densities = [[0, len(self.term_2_genes[tA]) * len(self.term_2_genes[tB])] for tA, tB in term_pairs]
-        densities = [[0, 0] for tA, tB in term_pairs]
-        for span in pos_spanning_symm:
-            for pair_idx, count in span.iteritems():
-                densities[pair_idx][0] += count
-        for span in neg_spanning_symm:
-            for pair_idx, count in span.iteritems():
-                densities[pair_idx][1] += count
+    #     logger.debug('Summing up counts')
+    #     logger.debug('Time: %s', time.time())
+    #     ## densities = [[0, len(self.term_2_genes[tA]) * len(self.term_2_genes[tB])] for tA, tB in term_pairs]
+    #     densities = [[0, 0] for tA, tB in term_pairs]
+    #     for span in pos_spanning_symm:
+    #         for pair_idx, count in span.iteritems():
+    #             densities[pair_idx][0] += count
+    #     for span in neg_spanning_symm:
+    #         for pair_idx, count in span.iteritems():
+    #             densities[pair_idx][1] += count
 
-        # for pair_idx, count in collections.Counter(pos_spanning_union).iteritems():
-        #     densities[pair_idx][0] = count
-        # for pair_idx, count in collections.Counter(neg_spanning_union).iteritems():
-        #     densities[pair_idx][1] = count
+    #     # for pair_idx, count in collections.Counter(pos_spanning_union).iteritems():
+    #     #     densities[pair_idx][0] = count
+    #     # for pair_idx, count in collections.Counter(neg_spanning_union).iteritems():
+    #     #     densities[pair_idx][1] = count
 
-        logger.debug('Calculating likelihood enrichment')
-        logger.debug('Time: %s', time.time())
-        # Likelihood enrichment
-        ll_enrichment = [ round((float(a) / (a+b)) / background_ll, 3) if (a+b) != 0 else 0.0 for a, b in densities ]
+    #     logger.debug('Calculating likelihood enrichment')
+    #     logger.debug('Time: %s', time.time())
+    #     # Likelihood enrichment
+    #     ll_enrichment = [ round((float(a) / (a+b)) / background_ll, 3) if (a+b) != 0 else 0.0 for a, b in densities ]
         
-        # # from scipy.stats import hypergeom
-        # logger.debug('Calculating hypergeometric enrichment')
-        # logger.debug('Start %s', time.time())
+    #     # # from scipy.stats import hypergeom
+    #     # logger.debug('Calculating hypergeometric enrichment')
+    #     # logger.debug('Start %s', time.time())
         
-        # p = multiprocessing.Pool(processes=16)
-        # # densities_groups = [densities[i * int(math.ceil(len(densities) / 16.)) : min(len(densities), (i+1) * int(math.ceil(len(densities) / 16.)))] for i in range(16)]
+    #     # p = multiprocessing.Pool(processes=16)
+    #     # # densities_groups = [densities[i * int(math.ceil(len(densities) / 16.)) : min(len(densities), (i+1) * int(math.ceil(len(densities) / 16.)))] for i in range(16)]
 
-        # densities = densities[:100]
+    #     # densities = densities[:100]
 
-        # rem, quot = len(densities) % 16, len(densities) / 16
-        # densities_groups = [densities[i * quot + (i if i < rem else rem):
-        #                               (i+1) * quot + (i+1 if i < rem else rem)] for i in range(16)]
-        # hyper_enrichment = [b for a in p.map(calc_hyper_enrich, [(total_pos, total_neg, x) for x in densities_groups]) for b in a]
-        # logger.debug('Finished calculating hypergeometric enrichment')
-        # logger.debug('End %s', time.time())
+    #     # rem, quot = len(densities) % 16, len(densities) / 16
+    #     # densities_groups = [densities[i * quot + (i if i < rem else rem):
+    #     #                               (i+1) * quot + (i+1 if i < rem else rem)] for i in range(16)]
+    #     # hyper_enrichment = [b for a in p.map(calc_hyper_enrich, [(total_pos, total_neg, x) for x in densities_groups]) for b in a]
+    #     # logger.debug('Finished calculating hypergeometric enrichment')
+    #     # logger.debug('End %s', time.time())
 
-        #hyper_enrichment = [1 - hypergeom.cdf(a, total_pos + total_neg, total_pos, b) for a, b in densities]
+    #     #hyper_enrichment = [1 - hypergeom.cdf(a, total_pos + total_neg, total_pos, b) for a, b in densities]
     
-        # self.term_2_genes = term_2_genes
+    #     # self.term_2_genes = term_2_genes
 
-        logger.debug('Finished Time: %s', time.time())
+    #     logger.debug('Finished Time: %s', time.time())
 
-        return ll_enrichment, densities
+    #     return ll_enrichment, densities
 
-    def single_enrichment(self, labels, logger=None):
+    # def single_enrichment(self, labels, logger=None):
 
-        if logger is None: logger = logging.getLogger(multiprocessing.current_process().name)
+    #     if logger is None: logger = logging.getLogger(multiprocessing.current_process().name)
 
-        logger.debug('Calculating single term enrichment')
+    #     logger.debug('Calculating single term enrichment')
 
-        logger.debug('Calculating background likelihood')
-        gsets = [(x, y) for x, y, z in zip(labels.labels, labels.Gset.gset_list, labels.Gset.to_remove) if not z]        
-        total_pos = sum(x for x, y in gsets)
-        total_neg = len(gsets) - total_pos        
+    #     logger.debug('Calculating background likelihood')
+    #     gsets = [(x, y) for x, y, z in zip(labels.labels, labels.Gset.gset_list, labels.Gset.to_remove) if not z]        
+    #     total_pos = sum(x for x, y in gsets)
+    #     total_neg = len(gsets) - total_pos        
                                                 
-        assert labels.Gset.dims == [2]
+    #     assert labels.Gset.dims == [2]
 
-        gene_2_terms_set = {g: set(t) for g, t in self.gene_2_terms.items()}
+    #     gene_2_terms_set = {g: set(t) for g, t in self.gene_2_terms.items()}
 
-        logger.debug('Calculating spanning pos gene pairs')
-        pos_gsets = [gset for pos, gset in gsets if pos]
-        pos_spanning = [b for g1, g2 in pos_gsets for b in gene_2_terms_set[g1] & gene_2_terms_set[g2]]
-        logger.debug('Calculating spanning neg gene pairs')
-        neg_gsets = [gset for pos, gset in gsets if not pos]
-        neg_spanning = [b for g1, g2 in neg_gsets for b in gene_2_terms_set[g1] & gene_2_terms_set[g2]]
+    #     logger.debug('Calculating spanning pos gene pairs')
+    #     pos_gsets = [gset for pos, gset in gsets if pos]
+    #     pos_spanning = [b for g1, g2 in pos_gsets for b in gene_2_terms_set[g1] & gene_2_terms_set[g2]]
+    #     logger.debug('Calculating spanning neg gene pairs')
+    #     neg_gsets = [gset for pos, gset in gsets if not pos]
+    #     neg_spanning = [b for g1, g2 in neg_gsets for b in gene_2_terms_set[g1] & gene_2_terms_set[g2]]
 
-        logger.debug('Summing up counts')
-        #densities = [[0, len(self.terms_2_genes[t]) * (len(self.terms_2_genes[t]) - 1) / 2] for t in range(len(self.terms))]
-        densities = [[0, 0] for t in range(len(self.terms))]
-        for term_idx, count in collections.Counter(pos_spanning).iteritems():
-            densities[term_idx][0] = count
-        for term_idx, count in collections.Counter(neg_spanning).iteritems():
-            densities[term_idx][1] = count
+    #     logger.debug('Summing up counts')
+    #     #densities = [[0, len(self.terms_2_genes[t]) * (len(self.terms_2_genes[t]) - 1) / 2] for t in range(len(self.terms))]
+    #     densities = [[0, 0] for t in range(len(self.terms))]
+    #     for term_idx, count in collections.Counter(pos_spanning).iteritems():
+    #         densities[term_idx][0] = count
+    #     for term_idx, count in collections.Counter(neg_spanning).iteritems():
+    #         densities[term_idx][1] = count
     
-        logger.debug('Calculating likelihood enrichment')
-        # Likelihood enrichment
-        background_ll = float(total_pos) / (total_pos + total_neg)
-        logger.debug('Total Pos / Neg: %s / %s', total_pos, total_neg)
-        logger.debug('Background likelihood: %s', background_ll)
-        ll_enrichment = [ round((float(a) / (a+b)) / background_ll, 3) if (a+b) != 0 else 0.0 for a, b in densities ]
+    #     logger.debug('Calculating likelihood enrichment')
+    #     # Likelihood enrichment
+    #     background_ll = float(total_pos) / (total_pos + total_neg)
+    #     logger.debug('Total Pos / Neg: %s / %s', total_pos, total_neg)
+    #     logger.debug('Background likelihood: %s', background_ll)
+    #     ll_enrichment = [ round((float(a) / (a+b)) / background_ll, 3) if (a+b) != 0 else 0.0 for a, b in densities ]
 
-        return ll_enrichment, densities
-
-
-class OntologyGraph(igraph.Graph):
-    def __init__(self, n=None, edges=None, directed=None, graph_attrs=None, vertex_attrs=None, edge_attrs=None):
-        igraph.Graph.__init__(self, n=None, edges=None, directed=None, graph_attrs=None, vertex_attrs=None, edge_attrs=None)
+    #     return ll_enrichment, densities
 
 
 
-def write_ontology_structure():
-    pass
-def write_ontology_annotations():
-    pass
+# class OntologyGraph(igraph.Graph):
+#     def __init__(self, n=None, edges=None, directed=None, graph_attrs=None, vertex_attrs=None, edge_attrs=None):
+#         igraph.Graph.__init__(self, n=None, edges=None, directed=None, graph_attrs=None, vertex_attrs=None, edge_attrs=None)
 
-def simulate_ontology(Gset, mapping, orig_int):
 
-    term_2_genes = {key: tuple(set([genes_index[a[0]] for a in group])) for key, group in \
-                    itertools.groupby(mapping, key=lambda a:a[1])}
-    term_sizes = {term: len(genes) for term, genes in term_2_genes.items()}
 
-    ess_win = [0,400]
-    ess_list = [t for t in terms if term_sizes[t] >= ess_win[0] and term_size[t] <= ess_win[1]]
+# def write_ontology_structure():
+#     pass
+# def write_ontology_annotations():
+#     pass
 
-    co_ess_win = [0,250]
-    co_ess_list = [t for t in terms if term_sizes[t] >= co_ess_win[0] and term_size[t] <= co_ess_win[1]]
+# def simulate_ontology(Gset, mapping, orig_int):
+
+#     term_2_genes = {key: tuple(set([genes_index[a[0]] for a in group])) for key, group in \
+#                     itertools.groupby(mapping, key=lambda a:a[1])}
+#     term_sizes = {term: len(genes) for term, genes in term_2_genes.items()}
+
+#     ess_win = [0,400]
+#     ess_list = [t for t in terms if term_sizes[t] >= ess_win[0] and term_size[t] <= ess_win[1]]
+
+#     co_ess_win = [0,250]
+#     co_ess_list = [t for t in terms if term_sizes[t] >= co_ess_win[0] and term_size[t] <= co_ess_win[1]]
     
-    interactions = []
+#     interactions = []
     
-    # Randomly pick a number of terms that are essential
-    while (len(interactions) < len(orig_int)):
-        if random.random() < 0.5:
-            # Randomly pick a number of terms that are essential
-            ess = random.choice(ess_list)
-            ess_list.remove(ess)
-            # Make interactions between every pair in term
-            interactions.extend(itertools.combinations(term_2_genes[ess], 2))
-        else:
-            # Randomly pick a number of terms that are co-essential
-            co_ess_1, co_ess_2 = random.sample(co_ess_list, 2)
-            co_ess_list.remove(co_ess_1)
-            co_ess_list.remove(co_ess_2)
+#     # Randomly pick a number of terms that are essential
+#     while (len(interactions) < len(orig_int)):
+#         if random.random() < 0.5:
+#             # Randomly pick a number of terms that are essential
+#             ess = random.choice(ess_list)
+#             ess_list.remove(ess)
+#             # Make interactions between every pair in term
+#             interactions.extend(itertools.combinations(term_2_genes[ess], 2))
+#         else:
+#             # Randomly pick a number of terms that are co-essential
+#             co_ess_1, co_ess_2 = random.sample(co_ess_list, 2)
+#             co_ess_list.remove(co_ess_1)
+#             co_ess_list.remove(co_ess_2)
 
-            interactions.extend([[x,y] for x in term_2_genes[co_ess_1] for y in term_2_genes[co_ess_2]])
+#             interactions.extend([[x,y] for x in term_2_genes[co_ess_1] for y in term_2_genes[co_ess_2]])
 
-    new_labels = [False for i in labels]
-    from sample_pos_and_neg import get_gset_idx
-    genes = Gset.genes
-    for g1, g2 in interactions: new_labels[get_gset_idx[genes[g1], genes[g2]], Gset.gset_idx, Gset.genes_idx] = 1
-    return new_labels
+#     new_labels = [False for i in labels]
+#     from sample_pos_and_neg import get_gset_idx
+#     genes = Gset.genes
+#     for g1, g2 in interactions: new_labels[get_gset_idx[genes[g1], genes[g2]], Gset.gset_idx, Gset.genes_idx] = 1
+#     return new_labels
 
-    # Set an upper limit of term sizes.  Perhaps co-essential
-    # terms. Continue picking terms and co-essential terms until there
-    # are at least as many genes in a synthetic lethal relation as
-    # there are originally, or as many number of synthetic lethal
-    # interactions as there are originally
+#     # Set an upper limit of term sizes.  Perhaps co-essential
+#     # terms. Continue picking terms and co-essential terms until there
+#     # are at least as many genes in a synthetic lethal relation as
+#     # there are originally, or as many number of synthetic lethal
+#     # interactions as there are originally
 
-    # Write annotations and ontology
+#     # Write annotations and ontology
     
 
-    # Propagate annotations?
-    'Rscript --propagate annotations'
+#     # Propagate annotations?
+#     'Rscript --propagate annotations'
 
-    pass
+#     pass
 
